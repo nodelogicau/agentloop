@@ -1,0 +1,380 @@
+// Package agent runs a model's tool-use loop through a provider: the model
+// sees the tools and instructions as an MCP server serves them, every call is
+// forwarded to a Caller, and tokens, tool calls and tool errors are counted.
+//
+// Extracted from particulars-bench (internal/agent, at commit acfd374) and
+// intentions-bench (Session, AddUser, truncation at max_tokens, and answering
+// every tool call before a loop ends).
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
+
+// Providers.
+const (
+	ProviderAnthropic = "anthropic"
+	ProviderOpenAI    = "openai"
+)
+
+// Providers lists the provider names.
+var Providers = []string{ProviderAnthropic, ProviderOpenAI}
+
+// ToolDef is a tool as the server lists it: name, description, and input
+// schema. Each provider renders it in its own format, unchanged.
+type ToolDef struct {
+	Name        string
+	Description string
+	Schema      map[string]any
+}
+
+// ToolCall is one tool call the model made. Args is the model's raw JSON,
+// which need not be valid.
+type ToolCall struct {
+	ID   string
+	Name string
+	Args json.RawMessage
+}
+
+// ToolResult answers one tool call.
+type ToolResult struct {
+	ID      string
+	Text    string
+	IsError bool
+}
+
+// Turn is one model response.
+type Turn struct {
+	Text      string
+	ToolCalls []ToolCall
+	// StopReason is the provider's own stop or finish reason.
+	StopReason string
+	// More reports that the model is waiting for its tool results.
+	More bool
+	// Truncated reports that the response stopped at the output limit.
+	Truncated bool
+	Usage     CallUsage
+}
+
+// Provider starts conversations with one model endpoint.
+type Provider interface {
+	Start(s Settings, system []string, user string, tools []ToolDef) (Conversation, error)
+}
+
+// Conversation is one loop's history, which the provider keeps in its own
+// form so that it is replayed without conversion.
+type Conversation interface {
+	// Send requests the next response. A response the provider declined
+	// to give returns its Turn with a *RefusalError.
+	Send(ctx context.Context) (Turn, error)
+	// AddToolResults answers the tool calls of the last response.
+	AddToolResults(results []ToolResult)
+	// AddUser appends a user message after the last response.
+	AddUser(text string)
+}
+
+// Caller forwards a tool call to an implementation.
+type Caller interface {
+	Call(ctx context.Context, name string, args json.RawMessage) (text string, isError bool, err error)
+}
+
+// Settings are the model parameters a run records. The provider fields are
+// omitted at the Anthropic defaults, so that settings recorded (and cache
+// keys computed) before providers existed are unchanged.
+type Settings struct {
+	// Provider is empty for anthropic.
+	Provider string `json:"provider,omitempty"`
+	// BaseURL is empty for the provider's SDK default.
+	BaseURL   string `json:"base_url,omitempty"`
+	Model     string `json:"model"`
+	Effort    string `json:"effort"`
+	MaxTokens int64  `json:"max_tokens"`
+	MaxTurns  int    `json:"max_turns"`
+	// Temperature is sent only when set.
+	Temperature *float64 `json:"temperature,omitempty"`
+	// ExtraBody is merged into every request body unchanged.
+	ExtraBody map[string]any `json:"extra_body,omitempty"`
+}
+
+// ProviderName returns the provider, anthropic when unset.
+func (s Settings) ProviderName() string {
+	if s.Provider == "" {
+		return ProviderAnthropic
+	}
+	return s.Provider
+}
+
+// Usage is token use, summed and per call. InputTokens includes cached
+// input, which is also broken out.
+type Usage struct {
+	Calls            int         `json:"calls"`
+	InputTokens      int64       `json:"input_tokens"`
+	OutputTokens     int64       `json:"output_tokens"`
+	CacheReadTokens  int64       `json:"cache_read_tokens"`
+	CacheWriteTokens int64       `json:"cache_write_tokens"`
+	PerCall          []CallUsage `json:"per_call,omitempty"`
+}
+
+// CallUsage is one request's tokens, and the upstream that served it when
+// the response names one.
+type CallUsage struct {
+	InputTokens      int64  `json:"input_tokens"`
+	OutputTokens     int64  `json:"output_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
+	CacheWriteTokens int64  `json:"cache_write_tokens"`
+	Upstream         string `json:"upstream,omitempty"`
+}
+
+// Add accumulates u2 into u.
+func (u *Usage) Add(u2 Usage) {
+	u.Calls += u2.Calls
+	u.InputTokens += u2.InputTokens
+	u.OutputTokens += u2.OutputTokens
+	u.CacheReadTokens += u2.CacheReadTokens
+	u.CacheWriteTokens += u2.CacheWriteTokens
+	u.PerCall = append(u.PerCall, u2.PerCall...)
+}
+
+func (u *Usage) record(c CallUsage) {
+	u.Calls++
+	u.InputTokens += c.InputTokens
+	u.OutputTokens += c.OutputTokens
+	u.CacheReadTokens += c.CacheReadTokens
+	u.CacheWriteTokens += c.CacheWriteTokens
+	u.PerCall = append(u.PerCall, c)
+}
+
+// Upstreams returns the distinct upstreams named by the calls.
+func (u Usage) Upstreams() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, c := range u.PerCall {
+		if c.Upstream != "" && !seen[c.Upstream] {
+			seen[c.Upstream] = true
+			out = append(out, c.Upstream)
+		}
+	}
+	return out
+}
+
+// Result is the outcome of one loop.
+type Result struct {
+	// Text is the text of the final response.
+	Text       string `json:"text"`
+	StopReason string `json:"stop_reason"`
+	Turns      int    `json:"turns"`
+	// Capped reports that the turn cap, or an output limit the provider
+	// reports as truncation, ended the loop.
+	Capped     bool           `json:"capped,omitempty"`
+	ToolCalls  map[string]int `json:"tool_calls,omitempty"`
+	ToolErrors int            `json:"tool_errors,omitempty"`
+	// ToolErrorsByTool counts ToolErrors by tool name.
+	ToolErrorsByTool map[string]int `json:"tool_errors_by_tool,omitempty"`
+	// ToolErrorSamples are the first SamplesPerTool errors of each tool.
+	ToolErrorSamples []ToolErrorSample `json:"tool_error_samples,omitempty"`
+	Usage            Usage             `json:"usage"`
+}
+
+// SamplesPerTool and SampleBytes bound the tool errors a record keeps.
+const (
+	SamplesPerTool = 3
+	SampleBytes    = 500
+)
+
+// ToolErrorSample is one tool call that failed: the arguments the model sent
+// and the error that went back, each cut to SampleBytes.
+type ToolErrorSample struct {
+	Tool  string `json:"tool"`
+	Args  string `json:"args"`
+	Error string `json:"error"`
+}
+
+// AddSamples appends samples to dst, keeping at most SamplesPerTool of each
+// tool, the earliest first.
+func AddSamples(dst []ToolErrorSample, samples ...ToolErrorSample) []ToolErrorSample {
+	n := map[string]int{}
+	for _, s := range dst {
+		n[s.Tool]++
+	}
+	for _, s := range samples {
+		if n[s.Tool] < SamplesPerTool {
+			n[s.Tool]++
+			dst = append(dst, s)
+		}
+	}
+	return dst
+}
+
+// cut shortens s to at most SampleBytes, on a character boundary.
+func cut(s string) string {
+	if len(s) <= SampleBytes {
+		return s
+	}
+	i := SampleBytes - len("…")
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i] + "…"
+}
+
+// RefusalError is a response the provider declined to give (Anthropic
+// stop_reason "refusal", OpenAI finish_reason "content_filter").
+type RefusalError struct{ Category, Explanation string }
+
+func (e *RefusalError) Error() string {
+	return fmt.Sprintf("model refused (%s): %s", e.Category, e.Explanation)
+}
+
+// Request is one loop's inputs.
+type Request struct {
+	Settings
+	// Instructions is the server's initialize instructions, sent first in
+	// the system prompt; Phase follows it.
+	Instructions string
+	Phase        string
+	User         string
+	Tools        []ToolDef
+}
+
+func (r Request) system() []string {
+	var system []string
+	if r.Instructions != "" {
+		system = append(system, r.Instructions)
+	}
+	if r.Phase != "" {
+		system = append(system, r.Phase)
+	}
+	return system
+}
+
+// Session is one conversation held across several user messages: each Send
+// runs the tool-use loop for one message, and the history carries over.
+type Session struct {
+	p    Provider
+	c    Caller
+	req  Request
+	conv Conversation
+}
+
+// NewSession prepares a conversation; Request.User is ignored.
+func NewSession(p Provider, c Caller, req Request) *Session {
+	return &Session{p: p, c: c, req: req}
+}
+
+// Send adds a user message and drives the loop until the model stops
+// calling tools or MaxTurns model calls have been made for this message.
+func (s *Session) Send(ctx context.Context, user string) (Result, error) {
+	if s.conv == nil {
+		conv, err := s.p.Start(s.req.Settings, s.req.system(), user, s.req.Tools)
+		if err != nil {
+			return newResult(), err
+		}
+		s.conv = conv
+	} else {
+		s.conv.AddUser(user)
+	}
+	return loop(ctx, s.conv, s.c, s.req.Tools, s.req.MaxTurns)
+}
+
+// Run drives one loop until the model stops calling tools or MaxTurns model
+// calls have been made. Tool-level errors go back to the model as the server
+// returned them, and calls of a tool not offered or with arguments that are
+// not valid JSON go back as an error result without reaching the server; a
+// protocol error ends the loop with an error.
+func Run(ctx context.Context, p Provider, c Caller, req Request) (Result, error) {
+	return NewSession(p, c, req).Send(ctx, req.User)
+}
+
+func newResult() Result {
+	return Result{ToolCalls: map[string]int{}, ToolErrorsByTool: map[string]int{}}
+}
+
+func loop(ctx context.Context, conv Conversation, c Caller, tools []ToolDef, maxTurns int) (Result, error) {
+	res := newResult()
+	offered := map[string]bool{}
+	for _, t := range tools {
+		offered[t.Name] = true
+	}
+	for {
+		if maxTurns > 0 && res.Turns >= maxTurns {
+			res.Capped = true
+			return res, nil
+		}
+		turn, err := conv.Send(ctx)
+		var refusal *RefusalError
+		if err != nil && !errors.As(err, &refusal) {
+			return res, err
+		}
+		res.Turns++
+		res.Usage.record(turn.Usage)
+		res.StopReason = turn.StopReason
+		if refusal != nil {
+			return res, err
+		}
+		res.Text = strings.TrimSpace(turn.Text)
+		if turn.Truncated {
+			res.Capped = true
+		}
+
+		var results []ToolResult
+		for _, call := range turn.ToolCalls {
+			res.ToolCalls[call.Name]++
+			if !offered[call.Name] {
+				results = append(results, ToolResult{ID: call.ID, IsError: true,
+					Text: fmt.Sprintf("unknown tool %q: not one of the tools offered", call.Name)})
+				continue
+			}
+			if !json.Valid(call.Args) {
+				results = append(results, ToolResult{ID: call.ID, IsError: true,
+					Text: fmt.Sprintf("invalid tool arguments: not a JSON value: %s", call.Args)})
+				continue
+			}
+			out, isErr, err := c.Call(ctx, call.Name, call.Args)
+			if err != nil {
+				return res, fmt.Errorf("tool %s: %w", call.Name, err)
+			}
+			results = append(results, ToolResult{ID: call.ID, Text: out, IsError: isErr})
+		}
+		// Each call has one result, in order.
+		for i, r := range results {
+			if r.IsError {
+				call := turn.ToolCalls[i]
+				res.ToolErrors++
+				res.ToolErrorsByTool[call.Name]++
+				res.ToolErrorSamples = AddSamples(res.ToolErrorSamples,
+					ToolErrorSample{Tool: call.Name, Args: cut(string(call.Args)), Error: cut(r.Text)})
+			}
+		}
+		// Every tool call is answered, even when the loop ends here, so that
+		// a later user message continues a well-formed history.
+		if len(results) > 0 {
+			conv.AddToolResults(results)
+		}
+		if !turn.More || len(results) == 0 {
+			return res, nil
+		}
+	}
+}
+
+// Complete sends a single request with no tools and returns its text.
+func Complete(ctx context.Context, p Provider, s Settings, system, user string) (string, Usage, error) {
+	res, err := Run(ctx, p, nil, Request{Settings: s, Phase: system, User: user})
+	return res.Text, res.Usage, err
+}
+
+// New returns the provider for s, authenticated with apiKey.
+func New(s Settings, apiKey string) (Provider, error) {
+	switch s.ProviderName() {
+	case ProviderAnthropic:
+		return NewAnthropic(anthropicOptions(s, apiKey)...), nil
+	case ProviderOpenAI:
+		return NewOpenAI(openAIOptions(s, apiKey)...), nil
+	default:
+		return nil, fmt.Errorf("unknown provider %q (known: %v)", s.Provider, Providers)
+	}
+}
